@@ -62,6 +62,47 @@ class X_Attention(nn.Module):
         return h + h_res
     
 
+class Attention_block(nn.Module):
+    """Some Information about Attention_block"""
+    def __init__(self, inp, hidden_dim, num_head):
+        super(Attention_block, self).__init__()
+        self.sa1 = X_Attention(inp, hidden_dim, num_head)
+        self.sa2 = X_Attention(inp, hidden_dim, num_head)
+        self.ca = X_Attention(inp, hidden_dim, num_head)
+        self.norm1 = nn.LayerNorm(hidden_dim // num_head)
+        self.norm2 = nn.LayerNorm(hidden_dim // num_head)
+        self.norm3 = nn.LayerNorm(hidden_dim // num_head)
+
+    def forward(self, x, c):
+        x = self.sa1(x, x)
+        x = self.norm1(x)
+        x = nn.ReLU(x)
+        x = self.sa2(x, x)
+        x = self.norm2(x)
+        x = nn.ReLU(x)
+        x = self.ca(x, c)
+        x = self.norm3(x)
+        x = nn.ReLU(x)
+
+        return x
+
+
+class Denosier(nn.Module):
+    """Some Information about Denosier"""
+    def __init__(self, inp, oup, hidden_dim, num_head):
+        super(Denosier, self).__init__()
+        self.block1 = Attention_block(inp, hidden_dim, num_head)
+        self.block2 = Attention_block(inp, hidden_dim, num_head)
+        self.oup = nn.Linear(inp, oup)
+
+    def forward(self, x, c):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.oup(x)
+
+        return x
+
+
 if __name__ == '__main__':
     rt = rotPosiEmb(64)
     a = torch.ones(32, 2, 8, 64)
