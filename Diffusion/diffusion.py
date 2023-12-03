@@ -30,20 +30,31 @@ class Self_Attention(nn.Module):
         self.inp = inp
         self.head_dim = head_dim
         self.hidden_dim = hidden_dim
+        self.pe = rotPosiEmb(hidden_dim // head_dim)
+        self.softmax = nn.softmax(dim=-1)
         self.Q = nn.Linear(inp, hidden_dim)
         self.K = nn.Linear(inp, hidden_dim)
         self.V = nn.Linear(inp, hidden_dim)
+        self.output = nn.Lineear(hidden_dim, inp)
         self.scale = (hidden_dim // head_dim) ** -0.5
         
     def forward(self, x):
+        h_res = x
         att_shape = (*x.shape[:-1], self.head_dim, self.hidden_dim // self.head_dim)
         q, k, v = self.Q(x), self.K(x), self.V(x)
         q = q.view(att_shape)
         k = k.view(att_shape)
         v = v.view(att_shape)
+        q = self.pe(q)
+        k = self.pe(k)
         
-        att_map = torch.einsum('bihd, bjhd -> bhij')
-        return x
+        att_map = torch.einsum('bihd, bjhd -> bhij', q, v)
+        att_map = self.softmax(att_map * self.scale)
+        h = torch.einsum('bhij, bjhd -> bihd', att_map, v)
+        h = h.reshape(*h.shape[:-2], -1)
+        h = self.output(h)
+        
+        return h + h_res
     
 
 if __name__ == '__main__':
