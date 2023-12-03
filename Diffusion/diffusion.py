@@ -47,7 +47,7 @@ class Self_Attention(nn.Module):
     
 
 if __name__ == '__main__':
-    rt = rotPosiEmb(512)
+    rt = rotPosiEmb(64)
     a = torch.ones(32, 16, 8, 64)
     b = rt(a)
     print(b)
