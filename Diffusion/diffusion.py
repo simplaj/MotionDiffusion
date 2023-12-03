@@ -23,10 +23,10 @@ class rotPosiEmb(nn.Module):
         return rx
 
 
-class Self_Attention(nn.Module):
-    """Some Information about Self_Attention"""
+class X_Attention(nn.Module):
+    """Some Information about X_Attention"""
     def __init__(self, inp, hidden_dim, head_dim):
-        super(Self_Attention, self).__init__()
+        super(X_Attention, self).__init__()
         self.inp = inp
         self.head_dim = head_dim
         self.hidden_dim = hidden_dim
@@ -38,10 +38,15 @@ class Self_Attention(nn.Module):
         self.output = nn.Lineear(hidden_dim, inp)
         self.scale = (hidden_dim // head_dim) ** -0.5
         
-    def forward(self, x):
+    def forward(self, x, c):
+        '''
+        if use sa c=x else c=condition
+        x:traj feature
+        c:condition feature
+        '''
         h_res = x
         att_shape = (*x.shape[:-1], self.head_dim, self.hidden_dim // self.head_dim)
-        q, k, v = self.Q(x), self.K(x), self.V(x)
+        q, k, v = self.Q(c), self.K(x), self.V(x)
         q = q.view(att_shape)
         k = k.view(att_shape)
         v = v.view(att_shape)
