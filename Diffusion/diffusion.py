@@ -1,5 +1,9 @@
 import torch
+import numpy as np
 import torch.nn as nn
+import torch.nn.functional as F
+
+from utils import rff_embedding
 
 
 class rotPosiEmb(nn.Module):
@@ -102,9 +106,105 @@ class Denosier(nn.Module):
         return x
 
 
+def extract(a, t, x_shape):
+    b, *_ = t.shape
+    out = a.gather(-1, t)
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
+def linear_beta_schedule(timesteps):
+    scale = 1000 / timesteps
+    beta_start = scale * 0.0001
+    beta_end = scale * 0.02
+    return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
+
+
+class Diffusion(nn.Module):
+    def __init__(
+        self,
+        Net=Denosier,
+        inp=256,
+        oup=256,
+        hidden_dim=1024,
+        num_head=8,
+        timesteps=1000,   
+        ):
+        super().__init__()
+        self.model = Net(inp, oup, hidden_dim, num_head)
+        
+        betas = linear_beta_schedule(timesteps)
+        
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
+        
+        # helper function to register buffer from float64 to float32
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+
+        # calculations for diffusion q(x_t | x_{t-1}) and others
+
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+        
+        # calculations for posterior q(x_{t-1} | x_t, x_0)
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+
+        # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
+
+        register_buffer('posterior_variance', posterior_variance)
+
+        # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
+
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+        loss_weight = snr
+        register_buffer('loss_weight', loss_weight)
+        
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
+        self.rff = rff_embedding()
+    
+    def q_sample(self, x_start, t, noise):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+    
+    def loss_fn(self, x0, c, t):
+        b, n, c = x0.shape
+        noise = torch.randn_like(x0)
+        
+        x = self.q_sample(x0, t, noise)
+        t_embeding = self.rff(t)
+        x = torch.concat([x, t_embeding], dim=-1)
+        
+        out = self.model(x, c)
+        
+        loss = F.mse_loss(out, x0, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
+        
+    
+    def forward(self, x, c):
+        b, n, c, device = *x.shape, x.device
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        
+        return self.loss_fn(x, c, t)
+
+
 if __name__ == '__main__':
-    de = Denosier(256, 256, 1024, 8)
-    xT = torch.randn(1, 17, 256)
-    c = torch.randn(1, 17, 256)
-    x0 = de(xT, c)
-    print(x0.shape)
+    D = Diffusion()
+    print(D.betas)
