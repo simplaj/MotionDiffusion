@@ -5,7 +5,7 @@ from sklearn.decomposition import PCA
 
 
 def rff_embedding():
-    gs = rff.layers.GaussianEncoding(sigma=10.0, input_size=1, encoded_size=128)
+    gs = rff.layers.GaussianEncoding(sigma=10.0, input_size=1, encoded_size=64)
     return gs
 
 

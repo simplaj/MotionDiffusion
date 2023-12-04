@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from einops import reduce
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -124,7 +125,7 @@ class Diffusion(nn.Module):
         self,
         Net=Denosier,
         inp=256,
-        oup=256,
+        oup=128,
         hidden_dim=1024,
         num_head=8,
         timesteps=1000,   
@@ -181,15 +182,16 @@ class Diffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
     
-    def loss_fn(self, x0, c, t):
+    def loss_fn(self, x0, con, t):
         b, n, c = x0.shape
         noise = torch.randn_like(x0)
         
         x = self.q_sample(x0, t, noise)
         t_embeding = self.rff(t)
+        t_embeding = t_embeding.repeat(b, n, 1)
         x = torch.concat([x, t_embeding], dim=-1)
         
-        out = self.model(x, c)
+        out = self.model(x, con)
         
         loss = F.mse_loss(out, x0, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
@@ -198,13 +200,16 @@ class Diffusion(nn.Module):
         return loss.mean()
         
     
-    def forward(self, x, c):
+    def forward(self, x, con):
         b, n, c, device = *x.shape, x.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         
-        return self.loss_fn(x, c, t)
+        return self.loss_fn(x, con, t)
 
 
 if __name__ == '__main__':
     D = Diffusion()
-    print(D.betas)
+    x = torch.ones(1, 17, 128)
+    c = torch.ones(1, 17, 256)
+    loss = D(x, c)
+    print(loss)
