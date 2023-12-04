@@ -31,11 +31,11 @@ class X_Attention(nn.Module):
         self.head_dim = head_dim
         self.hidden_dim = hidden_dim
         self.pe = rotPosiEmb(hidden_dim // head_dim)
-        self.softmax = nn.softmax(dim=-1)
+        self.softmax = nn.Softmax(dim=-1)
         self.Q = nn.Linear(inp, hidden_dim)
         self.K = nn.Linear(inp, hidden_dim)
         self.V = nn.Linear(inp, hidden_dim)
-        self.output = nn.Lineear(hidden_dim, inp)
+        self.output = nn.Linear(hidden_dim, inp)
         self.scale = (hidden_dim // head_dim) ** -0.5
         
     def forward(self, x, c):
@@ -66,23 +66,22 @@ class Attention_block(nn.Module):
     """Some Information about Attention_block"""
     def __init__(self, inp, hidden_dim, num_head):
         super(Attention_block, self).__init__()
-        self.sa1 = X_Attention(inp, hidden_dim, num_head)
-        self.sa2 = X_Attention(inp, hidden_dim, num_head)
+        self.sa_blocks = nn.ModuleList()
+        self.norm_blocks = nn.ModuleList()
+        for i in range(4):
+            self.sa_blocks.append(X_Attention(inp, hidden_dim, num_head))
+            self.norm_blocks.append(nn.LayerNorm(inp))
         self.ca = X_Attention(inp, hidden_dim, num_head)
-        self.norm1 = nn.LayerNorm(hidden_dim // num_head)
-        self.norm2 = nn.LayerNorm(hidden_dim // num_head)
-        self.norm3 = nn.LayerNorm(hidden_dim // num_head)
+        self.norm_blocks.append(nn.LayerNorm(inp))
 
     def forward(self, x, c):
-        x = self.sa1(x, x)
-        x = self.norm1(x)
-        x = nn.ReLU(x)
-        x = self.sa2(x, x)
-        x = self.norm2(x)
-        x = nn.ReLU(x)
+        for i in range(4):
+            x = self.sa_blocks[i](x, c)
+            x = self.norm_blocks[i](x)
+            x = nn.ReLU()(x)
         x = self.ca(x, c)
-        x = self.norm3(x)
-        x = nn.ReLU(x)
+        x = self.norm_blocks[-1](x)
+        x = nn.ReLU()(x)
 
         return x
 
@@ -96,15 +95,16 @@ class Denosier(nn.Module):
         self.oup = nn.Linear(inp, oup)
 
     def forward(self, x, c):
-        x = self.block1(x)
-        x = self.block2(x)
+        x = self.block1(x, c)
+        x = self.block2(x, c)
         x = self.oup(x)
 
         return x
 
 
 if __name__ == '__main__':
-    rt = rotPosiEmb(64)
-    a = torch.ones(32, 2, 8, 64)
-    b = rt(a)
-    print(b)
+    de = Denosier(256, 256, 1024, 8)
+    xT = torch.randn(1, 17, 256)
+    c = torch.randn(1, 17, 256)
+    x0 = de(xT, c)
+    print(x0.shape)
