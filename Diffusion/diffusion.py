@@ -1,11 +1,15 @@
-import rff
 import torch
-import numpy as np
-from einops import reduce
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.decomposition import PCA
+from torch.optim import AdamW
+from torch.utils.data import Dataset, DataLoader
+
+import rff
+import numpy as np
 from tqdm import tqdm
+from pathlib import Path
+from einops import reduce
+from sklearn.decomposition import PCA
 
 
 class rotPosiEmb(nn.Module):
@@ -221,6 +225,7 @@ class Diffusion(nn.Module):
         self.num_joints = 17
         self.channels = 128
     
+    @autocast(enable=False)
     def q_sample(self, x_start, t, noise):
         noise = default(noise, lambda: torch.randn_like(x_start))
         
@@ -325,15 +330,30 @@ class Diffusion(nn.Module):
         return y
 
 
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+
 class Trainer(object):
     def __init__(
         self,
         diffusion: Diffusion,
+        dataset: Dataset,
+        ema_update_every = 10,
+        ema_decay = 0.995,
         weight_decay=0.03,
         learning_rate=5e-4,
         train_batch_size=16,
         train_num_steps=100000,
+        gradient_accumulate_every = 1,
         save_and_sample_every=1000,
+        results_folder='./rst',
+        amp=False,
+        split_batches=True,
+        mixed_precision_type='fp16',
+        max_grad_norm = 1.
     ):
         super.__init__()
         
@@ -342,6 +362,115 @@ class Trainer(object):
             mixed_precision = mixed_precision_type if amp else 'no'
         )
         
+        self.model = diffusion
+        self.channels = self.model.channels
+        
+        self.save_and_sample_every = save_and_sample_every
+        self.batch_size = train_batch_size
+        self.train_num_steps = train_num_steps
+        
+        dl = DataLoader(dataset, batch_size=train_batch_size, shuffle=True, 
+                        pin_memory=True, num_workers=cpu_count())
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+        
+        self.opt = AdamW(diffusion.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion, beta=ema_decay, update_every=ema_update_every)
+            self.ema.to(self.device)
+            
+        self.rst_folder = Path(results_folder)
+        self.rst_folder.mkdir(exist_ok=True)
+        
+        self.step=0
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        
+    @property
+    def device(self):
+        return self.accelerator.device
+    
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+            'version': __version__
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+            
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data = next(self.dl).to(device)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'loss: {total_loss:.4f}')
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            milestone = self.step // self.save_and_sample_every
+                            res = self.ema.ema_model.sample(batch_size=4)
+                        torch.save(res, str(self.results_folder / f'sample-{milestone}.pt'))
+                        self.save(milestone)
+
+                pbar.update(1)
+
+        accelerator.print('training complete')     
 
 
 def predict_example():
