@@ -2,14 +2,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.cuda.amp import autocast
 from torch.utils.data import Dataset, DataLoader
 
 import rff
 import numpy as np
 from tqdm import tqdm
 from pathlib import Path
+from multiprocessing import cpu_count
 from einops import reduce
+from ema_pytorch import EMA
+from accelerate import Accelerator
 from sklearn.decomposition import PCA
+
+from dataset import Traj
 
 
 class rotPosiEmb(nn.Module):
@@ -225,7 +231,7 @@ class Diffusion(nn.Module):
         self.num_joints = 17
         self.channels = 128
     
-    @autocast(enable=False)
+    @autocast(enabled = False)
     def q_sample(self, x_start, t, noise):
         noise = default(noise, lambda: torch.randn_like(x_start))
         
@@ -240,8 +246,8 @@ class Diffusion(nn.Module):
         
         x = self.q_sample(x0, t, noise)
         self.rff = rff.layers.GaussianEncoding(sigma=10.0, input_size=b, encoded_size=64)
-        t_embeding = self.rff(t)
-        t_embeding = t_embeding.repeat(b, n, 1)
+        t_embeding = self.rff(t.cpu())
+        t_embeding = t_embeding.repeat(b, n, 1).to(x0.device)
         
         out = self.model(x, con, t_embeding)
         
@@ -355,7 +361,7 @@ class Trainer(object):
         mixed_precision_type='fp16',
         max_grad_norm = 1.
     ):
-        super.__init__()
+        super().__init__()
         
         self.accelerator = Accelerator(
             split_batches = split_batches,
@@ -366,7 +372,10 @@ class Trainer(object):
         self.channels = self.model.channels
         
         self.save_and_sample_every = save_and_sample_every
+        
         self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.max_grad_norm = max_grad_norm
         self.train_num_steps = train_num_steps
         
         dl = DataLoader(dataset, batch_size=train_batch_size, shuffle=True, 
@@ -439,7 +448,7 @@ class Trainer(object):
                     data = next(self.dl).to(device)
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data[:,:, :10], data[:, :, 10:])
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -470,7 +479,7 @@ class Trainer(object):
 
                 pbar.update(1)
 
-        accelerator.print('training complete')     
+        accelerator.print('training complete')   
 
 
 def predict_example():
@@ -500,4 +509,10 @@ def sample_example():
 
 
 if __name__ == '__main__':
-    predict_example()
+    d = Diffusion()
+    data = Traj()
+    trainer = Trainer(
+        diffusion=d,
+        dataset=data
+        )
+    trainer.train()
