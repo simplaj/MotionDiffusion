@@ -16,7 +16,7 @@ def pca(x):
     return x_new, pca
 
 
-def inverse_pac(pca, x):
+def inverse_pca(pca, x):
     return pca.inverse_transform(x)
 
  

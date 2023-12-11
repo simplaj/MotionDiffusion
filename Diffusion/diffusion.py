@@ -95,14 +95,19 @@ class Denosier(nn.Module):
     """Some Information about Denosier"""
     def __init__(self, inp, oup, hidden_dim, num_head):
         super(Denosier, self).__init__()
+        self.proj1 = nn.Linear(10 + inp, inp)
         self.block1 = Attention_block(inp, hidden_dim, num_head)
         self.block2 = Attention_block(inp, hidden_dim, num_head)
         self.oup = nn.Linear(inp, oup)
+        self.proj2 = nn.Linear(oup, 10)
 
-    def forward(self, x, c):
+    def forward(self, x, c, t):
+        x = torch.cat([x, t], dim=-1)
+        x = self.proj1(x)
         x = self.block1(x, c)
         x = self.block2(x, c)
         x = self.oup(x)
+        x = self.proj2(x)
 
         return x
 
@@ -120,18 +125,47 @@ def linear_beta_schedule(timesteps):
     return torch.linspace(beta_start, beta_end, timesteps, dtype = torch.float64)
 
 
+def exists(x):
+    return x is not None
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
+
+
+def get_dct_matrix(N, is_torch=True):
+    dct_m = np.eye(N)
+    for k in np.arange(N):
+        for i in np.arange(N):
+            w = np.sqrt(2 / N)
+            if k == 0:
+                w = np.sqrt(1 / N)
+            dct_m[k, i] = w * np.cos(np.pi * (i + 1 / 2) * k / N)
+    idct_m = np.linalg.inv(dct_m)
+    if is_torch:
+        dct_m = torch.from_numpy(dct_m)
+        idct_m = torch.from_numpy(idct_m)
+    return dct_m, idct_m
+
+
 class Diffusion(nn.Module):
     def __init__(
         self,
+        pca,  
         Net=Denosier,
-        inp=256,
+        inp=128,
         oup=128,
         hidden_dim=1024,
+        objective = 'pred_noise',
         num_head=8,
-        timesteps=1000,   
+        timesteps=1000,
         ):
         super().__init__()
         self.model = Net(inp, oup, hidden_dim, num_head)
+        self.objective = objective
+        self.is_ddim_sampling = False
         
         betas = linear_beta_schedule(timesteps)
         
@@ -169,14 +203,25 @@ class Diffusion(nn.Module):
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
         snr = alphas_cumprod / (1 - alphas_cumprod)
-        loss_weight = snr
+        
+        if objective == 'pred_noise':
+            loss_weight = torch.ones_like(snr)
+        elif objective == 'pred_x0':
+            loss_weight = snr
+        elif objective == 'pred_v':
+            loss_weight = snr / (snr + 1)
+            
         register_buffer('loss_weight', loss_weight)
         
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
         self.rff = rff_embedding()
+        self.num_joints = 17
+        self.channels = 128
     
     def q_sample(self, x_start, t, noise):
+        noise = default(noise, lambda: torch.randn_like(x_start))
+        
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
@@ -189,16 +234,24 @@ class Diffusion(nn.Module):
         x = self.q_sample(x0, t, noise)
         t_embeding = self.rff(t)
         t_embeding = t_embeding.repeat(b, n, 1)
-        x = torch.concat([x, t_embeding], dim=-1)
         
-        out = self.model(x, con)
+        out = self.model(x, con, t_embeding)
         
-        loss = F.mse_loss(out, x0, reduction='none')
+        if self.objective == 'pred_noise':
+            target = noise
+        elif self.objective == 'pred_x0':
+            target = x_start
+        elif self.objective == 'pred_v':
+            v = self.predict_v(x_start, t, noise)
+            target = v
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+        
+        loss = F.mse_loss(out, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
-        
     
     def forward(self, x, con):
         b, n, c, device = *x.shape, x.device
@@ -206,10 +259,45 @@ class Diffusion(nn.Module):
         
         return self.loss_fn(x, con, t)
 
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    @torch.no_grad()
+    def sample(self, x, c, mask):
+        y = torch.randn_like(x, device=x.device)
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            b, n, c = y.shape
+            t_embeding = self.rff(t)
+            t_embeding = t_embeding.repeat(b, n, 1)
+            
+            out = self.model(y, c, t_embeding)
+            
+            if self.objective == 'pred_noise':
+                pred_noise = out
+                y_de = self.predict_start_from_noise(y, t, pred_noise)
+            
+            y_no = self.q_sample(x, t)
+            
+            y = self.pca(mask * self.inverse_pca(y_no) + (1 - mask) * self.inverse_pca(y_de))
+            
+        return y
+
 
 if __name__ == '__main__':
-    D = Diffusion()
-    x = torch.ones(1, 17, 128)
-    c = torch.ones(1, 17, 256)
-    loss = D(x, c)
-    print(loss)
+    
+    from sklearn.decomposition import PCA
+    x = torch.ones(17, 100, 3)
+    c = torch.ones(17, 256)
+    pca = PCA(n_components=10)
+    pca.fit(x.reshape(17, -1))
+    D = Diffusion(pca=pca)
+    x = torch.tensor(D.pca_ff(x.reshape(17, -1)))
+    print(x.shape)
+
+    mask = torch.cat([torch.ones(1), torch.zeros(10)])
+    loss = D(x.unsqueeze(0), c)
+    a = D.sample(x, c)
+    print(loss, a)
