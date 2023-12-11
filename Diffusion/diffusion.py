@@ -15,8 +15,6 @@ from ema_pytorch import EMA
 from accelerate import Accelerator
 from sklearn.decomposition import PCA
 
-from dataset import Traj
-
 
 class rotPosiEmb(nn.Module):
     """Some Information about rotPosiEmb"""
@@ -324,8 +322,8 @@ class Diffusion(nn.Module):
             b, n, _ = y.shape
             t = torch.full((b,), t, device = self.betas.device, dtype = torch.long)
             self.rff = rff.layers.GaussianEncoding(sigma=10.0, input_size=b, encoded_size=64)
-            t_embeding = self.rff(t)
-            t_embeding = t_embeding.repeat(b, n, 1)
+            t_embeding = self.rff(t.cpu())
+            t_embeding = t_embeding.repeat(b, n, 1).to(self.betas.device)
             
             out = self.model(y, c, t_embeding)
             
@@ -409,10 +407,10 @@ class Trainer(object):
             'opt': self.opt.state_dict(),
             'ema': self.ema.state_dict(),
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
-            'version': __version__
+            'version': '0.1'
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.rst_folder / f'model-{milestone}.pt'))
             
     def load(self, milestone):
         accelerator = self.accelerator
@@ -474,7 +472,7 @@ class Trainer(object):
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
                             res = self.ema.ema_model.sample(batch_size=4)
-                        torch.save(res, str(self.results_folder / f'sample-{milestone}.pt'))
+                        torch.save(res, str(self.rst_folder / f'sample-{milestone}.pt'))
                         self.save(milestone)
 
                 pbar.update(1)
@@ -509,10 +507,13 @@ def sample_example():
 
 
 if __name__ == '__main__':
+    from dataset import Traj
     d = Diffusion()
     data = Traj()
     trainer = Trainer(
         diffusion=d,
-        dataset=data
+        dataset=data,
+        train_num_steps=1000,
+        save_and_sample_every=10
         )
     trainer.train()
