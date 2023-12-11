@@ -1,3 +1,4 @@
+import rff
 import torch
 import numpy as np
 from einops import reduce
@@ -5,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.decomposition import PCA
 from tqdm import tqdm
-from utils import rff_embedding
 
 
 class rotPosiEmb(nn.Module):
@@ -154,7 +154,7 @@ def get_dct_matrix(N, is_torch=True):
 class Diffusion(nn.Module):
     def __init__(
         self,
-        pca,
+        pca=None,
         Net=Denosier,
         inp=256,
         oup=128,
@@ -217,7 +217,7 @@ class Diffusion(nn.Module):
         
         timesteps, = betas.shape
         self.num_timesteps = int(timesteps)
-        self.rff = rff_embedding()
+        self.rff = None
         self.num_joints = 17
         self.channels = 128
     
@@ -234,6 +234,7 @@ class Diffusion(nn.Module):
         noise = torch.randn_like(x0)
         
         x = self.q_sample(x0, t, noise)
+        self.rff = rff.layers.GaussianEncoding(sigma=10.0, input_size=b, encoded_size=64)
         t_embeding = self.rff(t)
         t_embeding = t_embeding.repeat(b, n, 1)
         
@@ -283,7 +284,7 @@ class Diffusion(nn.Module):
         return x
 
     @torch.no_grad()
-    def sample(self, x, c, mask, ori_shape):
+    def predict(self, x, c, mask, ori_shape):
         self.ori_shape = ori_shape
         y = torch.randn_like(x, device=x.device)
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
@@ -304,12 +305,50 @@ class Diffusion(nn.Module):
             
         return y
 
+    @torch.no_grad()
+    def sample(self, batch_size=4):
+        y = torch.randn((batch_size, self.num_joints, 10), device=self.betas.device)
+        c = torch.ones((batch_size, self.num_joints, self.channels * 2), device=self.betas.device)
+        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+            b, n, _ = y.shape
+            t = torch.full((b,), t, device = self.betas.device, dtype = torch.long)
+            self.rff = rff.layers.GaussianEncoding(sigma=10.0, input_size=b, encoded_size=64)
+            t_embeding = self.rff(t)
+            t_embeding = t_embeding.repeat(b, n, 1)
+            
+            out = self.model(y, c, t_embeding)
+            
+            if self.objective == 'pred_noise':
+                pred_noise = out
+                y = self.predict_start_from_noise(y, t, pred_noise)
+            
+        return y
 
-def sample_example():
+
+class Trainer(object):
+    def __init__(
+        self,
+        diffusion: Diffusion,
+        weight_decay=0.03,
+        learning_rate=5e-4,
+        train_batch_size=16,
+        train_num_steps=100000,
+        save_and_sample_every=1000,
+    ):
+        super.__init__()
+        
+        self.accelerator = Accelerator(
+            split_batches = split_batches,
+            mixed_precision = mixed_precision_type if amp else 'no'
+        )
+        
+
+
+def predict_example():
     x = torch.ones(1, 17, 10)
     c = torch.ones(1, 17, 256)
     pca = PCA(n_components=10)
-    D = Diffusion(pca)
+    D = Diffusion()
     a = D(x, c)
     print(a)
     
@@ -321,8 +360,15 @@ def sample_example():
     D.pca_ = pca
     x = pca.transform(X)
     x = torch.tensor(x, dtype=X.dtype).unsqueeze(0)
-    a = D.sample(x, c, mask, ori_shape)
+    a = D.predict(x, c, mask, ori_shape)
+    print(a.shape)
+
+
+def sample_example():
+    d = Diffusion()
+    a = d.sample()
+    print(a)
 
 
 if __name__ == '__main__':
-    sample_example()
+    predict_example()
