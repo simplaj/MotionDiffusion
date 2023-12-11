@@ -3,7 +3,8 @@ import numpy as np
 from einops import reduce
 import torch.nn as nn
 import torch.nn.functional as F
-
+from sklearn.decomposition import PCA
+from tqdm import tqdm
 from utils import rff_embedding
 
 
@@ -95,7 +96,7 @@ class Denosier(nn.Module):
     """Some Information about Denosier"""
     def __init__(self, inp, oup, hidden_dim, num_head):
         super(Denosier, self).__init__()
-        self.proj1 = nn.Linear(10 + inp, inp)
+        self.proj1 = nn.Linear(138, inp)
         self.block1 = Attention_block(inp, hidden_dim, num_head)
         self.block2 = Attention_block(inp, hidden_dim, num_head)
         self.oup = nn.Linear(inp, oup)
@@ -153,9 +154,9 @@ def get_dct_matrix(N, is_torch=True):
 class Diffusion(nn.Module):
     def __init__(
         self,
-        pca,  
+        pca,
         Net=Denosier,
-        inp=128,
+        inp=256,
         oup=128,
         hidden_dim=1024,
         objective = 'pred_noise',
@@ -166,6 +167,7 @@ class Diffusion(nn.Module):
         self.model = Net(inp, oup, hidden_dim, num_head)
         self.objective = objective
         self.is_ddim_sampling = False
+        self.pca_ = pca
         
         betas = linear_beta_schedule(timesteps)
         
@@ -264,12 +266,29 @@ class Diffusion(nn.Module):
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
+    
+    def pca(self, x):
+        b, n, *_ = x.shape
+        dtype = x.dtype
+        x = x.reshape(n, -1)
+        x = self.pca_.transform(x)
+        x = torch.tensor(x, dtype=dtype).reshape(b, n, -1)
+        return x
+    
+    def inverse_pca(self, x):
+        b, n, *_= x.shape
+        dtype = x.dtype
+        x = self.pca_.inverse_transform(x)
+        x = torch.tensor(x, dtype=dtype).reshape(b, n, *self.ori_shape[-2:])
+        return x
 
     @torch.no_grad()
-    def sample(self, x, c, mask):
+    def sample(self, x, c, mask, ori_shape):
+        self.ori_shape = ori_shape
         y = torch.randn_like(x, device=x.device)
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-            b, n, c = y.shape
+            b, n, _ = y.shape
+            t = torch.full((b,), t, device = x.device, dtype = torch.long)
             t_embeding = self.rff(t)
             t_embeding = t_embeding.repeat(b, n, 1)
             
@@ -279,25 +298,31 @@ class Diffusion(nn.Module):
                 pred_noise = out
                 y_de = self.predict_start_from_noise(y, t, pred_noise)
             
-            y_no = self.q_sample(x, t)
+            y_no = self.q_sample(x, t, noise=None)
             
             y = self.pca(mask * self.inverse_pca(y_no) + (1 - mask) * self.inverse_pca(y_de))
             
         return y
 
 
-if __name__ == '__main__':
-    
-    from sklearn.decomposition import PCA
-    x = torch.ones(17, 100, 3)
-    c = torch.ones(17, 256)
+def sample_example():
+    x = torch.ones(1, 17, 10)
+    c = torch.ones(1, 17, 256)
     pca = PCA(n_components=10)
-    pca.fit(x.reshape(17, -1))
-    D = Diffusion(pca=pca)
-    x = torch.tensor(D.pca_ff(x.reshape(17, -1)))
-    print(x.shape)
+    D = Diffusion(pca)
+    a = D(x, c)
+    print(a)
+    
+    mask = torch.cat([torch.ones(5), torch.zeros(995)]).unsqueeze(-1)
+    X = torch.ones(17, 1000, 3)
+    ori_shape = X.shape
+    X = X.reshape(17, -1)
+    pca.fit(X)
+    D.pca_ = pca
+    x = pca.transform(X)
+    x = torch.tensor(x, dtype=X.dtype).unsqueeze(0)
+    a = D.sample(x, c, mask, ori_shape)
 
-    mask = torch.cat([torch.ones(1), torch.zeros(10)])
-    loss = D(x.unsqueeze(0), c)
-    a = D.sample(x, c)
-    print(loss, a)
+
+if __name__ == '__main__':
+    sample_example()
